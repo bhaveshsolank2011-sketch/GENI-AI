@@ -2,7 +2,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000; 
 const API_KEY = process.env.OPENAI_API_KEY;
 const MEMORY_FILE = path.join(__dirname, "memory.json");
 const MODEL = "gpt-6-luna";
@@ -200,8 +200,6 @@ ${memoryText}`
   });
 });
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(
-    `GENI Backend running at http://127.0.0.1:${PORT}`
-  );
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`GENI Backend running on port ${PORT}`);
 });
