@@ -2,7 +2,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 
-const PORT = process.env.PORT || 3000; 
+const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.OPENAI_API_KEY;
 const MEMORY_FILE = path.join(__dirname, "memory.json");
 const MODEL = "gpt-6-luna";
@@ -50,7 +50,7 @@ async function askAI(input) {
 
   if (!response.ok) {
     throw new Error(
-      data.error?.message || "OpenAI API error"
+      data.error?.message || "AI API error"
     );
   }
 
@@ -69,7 +69,7 @@ async function updateMemory(message) {
   const result = await askAI([
     {
       role: "system",
-      content: `You manage GENI's long-term memory.
+      content: `You manage GENI AI's long-term memory.
 Return ONLY a valid JSON array of short strings.
 Preserve useful existing memories.
 Add stable user facts, preferences, goals and ongoing projects.
@@ -102,7 +102,7 @@ Output JSON only, without Markdown.`
     updated.every(item => typeof item === "string")
   ) {
     saveMemory(updated.slice(0, 100));
-    console.log("GENI memory saved 🧠");
+    console.log("GENI AI memory saved 🧠");
   }
 }
 
@@ -138,7 +138,7 @@ const server = http.createServer((req, res) => {
   req.on("end", async () => {
     try {
       if (!API_KEY) {
-        throw new Error("API key missing in Termux");
+        throw new Error("API key missing in server environment");
       }
 
       const { message } = JSON.parse(body);
@@ -156,10 +156,20 @@ const server = http.createServer((req, res) => {
       const reply = await askAI([
         {
           role: "system",
-          content: `Your name is GENI.
-You are a helpful AI assistant.
-Never say your name is ChatGPT.
-If asked your name, say: My name is GENI.
+          content: `IDENTITY:
+Your name is GENI AI.
+You are a helpful, friendly AI assistant created and configured by Bhavesh.
+
+CREATOR RULES:
+- If asked your name, say: "I am GENI AI."
+- If asked who created you, say: "I am GENI AI, created and configured by Bhavesh."
+- If asked who owns or developed the GENI AI app, explain that Bhavesh created and configured the app.
+- If asked who provides the underlying AI model or API, answer honestly that this app uses an AI model/API provided by OpenAI.
+- Never claim that Bhavesh personally trained or created the underlying OpenAI model.
+- Do not identify yourself as ChatGPT. Your assistant name is GENI AI.
+- Be honest; never invent facts about your creator or capabilities.
+- Reply in the user's language and tone.
+- Keep answers clear and helpful.
 
 Use saved memories when relevant.
 Never claim the user said something unless supported by memory.
@@ -179,13 +189,12 @@ ${memoryText}`
 
       res.end(JSON.stringify({ reply }));
 
-      // Save important facts automatically.
       updateMemory(message.trim()).catch(error => {
         console.log("Memory update failed:", error.message);
       });
 
     } catch (error) {
-      console.log("GENI error:", error.message);
+      console.log("GENI AI error:", error.message);
 
       if (!res.headersSent) {
         res.writeHead(500, {
@@ -201,5 +210,5 @@ ${memoryText}`
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`GENI Backend running on port ${PORT}`);
+  console.log(`GENI AI backend running on port ${PORT}`);
 });
