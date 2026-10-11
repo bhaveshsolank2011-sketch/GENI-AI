@@ -3,9 +3,9 @@ const fs = require("fs");
 const path = require("path");
 
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.OPENAI_API_KEY;
+const API_KEY = process.env.GEMINI_API_KEY;
+const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const MEMORY_FILE = path.join(__dirname, "memory.json");
-const MODEL = "gpt-6-luna";
 
 function readMemory() {
   try {
@@ -17,7 +17,8 @@ function readMemory() {
     const result = JSON.parse(data || "[]");
 
     return Array.isArray(result) ? result : [];
-  } catch {
+  } catch (error) {
+    console.error("Memory read failed:", error.message);
     return [];
   }
 }
@@ -31,17 +32,50 @@ function saveMemory(memory) {
 }
 
 async function askAI(input) {
+  if (!API_KEY) {
+    throw new Error("GEMINI_API_KEY is missing in Render environment");
+  }
+
+  const systemInstruction = input
+    .filter(item => item.role === "system")
+    .map(item => typeof item.content === "string"
+      ? item.content
+      : JSON.stringify(item.content))
+    .join("\n\n");
+
+  const contents = input
+    .filter(item => item.role !== "system")
+    .map(item => ({
+      role: item.role === "assistant" ? "model" : "user",
+      parts: [{
+        text: typeof item.content === "string"
+          ? item.content
+          : JSON.stringify(item.content)
+      }]
+    }));
+
+  if (contents.length === 0) {
+    throw new Error("No message provided to Gemini");
+  }
+
   const response = await fetch(
-    "https://api.openai.com/v1/responses",
+    `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
     {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${API_KEY}`
+        "x-goog-api-key": API_KEY
       },
       body: JSON.stringify({
-        model: MODEL,
-        input
+        systemInstruction: {
+          parts: [{
+            text: systemInstruction || "You are a helpful AI assistant."
+          }]
+        },
+        contents,
+        generationConfig: {
+          temperature: 0.7
+        }
       })
     }
   );
@@ -49,18 +83,27 @@ async function askAI(input) {
   const data = await response.json();
 
   if (!response.ok) {
+    const message =
+      data.error?.message || "Gemini API request failed";
+
+    throw new Error(message);
+  }
+
+  const reply = data.candidates?.[0]?.content?.parts
+    ?.map(part => part.text || "")
+    .join("")
+    .trim();
+
+  if (!reply) {
+    const reason = data.candidates?.[0]?.finishReason;
     throw new Error(
-      data.error?.message || "AI API error"
+      reason
+        ? `Gemini returned no text. Finish reason: ${reason}`
+        : "Gemini returned an empty response"
     );
   }
 
-  return (
-    data.output
-      ?.filter(item => item.type === "message")
-      ?.flatMap(item => item.content || [])
-      ?.find(item => item.type === "output_text")
-      ?.text || ""
-  );
+  return reply;
 }
 
 async function updateMemory(message) {
@@ -103,6 +146,8 @@ Output JSON only, without Markdown.`
   ) {
     saveMemory(updated.slice(0, 100));
     console.log("GENI AI memory saved 🧠");
+  } else {
+    throw new Error("Gemini returned an invalid memory format");
   }
 }
 
@@ -117,31 +162,50 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method !== "POST" || req.url !== "/chat") {
-    res.writeHead(404);
+    res.writeHead(404, {
+      "Content-Type": "text/plain; charset=utf-8"
+    });
     return res.end("Not found");
   }
 
   let body = "";
+  let tooLarge = false;
 
   req.on("data", chunk => {
-    body += chunk;
+    if (tooLarge) return;
+
+    body += chunk.toString();
 
     if (body.length > 1000000) {
-      res.writeHead(413);
+      tooLarge = true;
+      res.writeHead(413, {
+        "Content-Type": "application/json; charset=utf-8"
+      });
       res.end(JSON.stringify({
         error: "Message too large"
       }));
-      req.destroy();
     }
   });
 
   req.on("end", async () => {
+    if (tooLarge) return;
+
     try {
       if (!API_KEY) {
-        throw new Error("API key missing in server environment");
+        throw new Error(
+          "GEMINI_API_KEY missing. Add it in Render environment variables."
+        );
       }
 
-      const { message } = JSON.parse(body);
+      let requestData;
+
+      try {
+        requestData = JSON.parse(body);
+      } catch {
+        throw new Error("Invalid JSON request");
+      }
+
+      const message = requestData.message;
 
       if (typeof message !== "string" || !message.trim()) {
         throw new Error("Please enter a message");
@@ -164,15 +228,14 @@ CREATOR RULES:
 - If asked your name, say: "I am GENI AI."
 - If asked who created you, say: "I am GENI AI, created and configured by Bhavesh."
 - If asked who owns or developed the GENI AI app, explain that Bhavesh created and configured the app.
-- If asked who provides the underlying AI model or API, answer honestly that this app uses an AI model/API provided by OpenAI.
-- Never claim that Bhavesh personally trained or created the underlying OpenAI model.
+- If asked who provides the underlying AI model or API, answer honestly that this app uses Google's Gemini AI API.
+- Never claim that Bhavesh personally trained or created Google's underlying Gemini model.
 - Do not identify yourself as ChatGPT. Your assistant name is GENI AI.
 - Be honest; never invent facts about your creator or capabilities.
 - Reply in the user's language and tone.
 - Keep answers clear and helpful.
-
-Use saved memories when relevant.
-Never claim the user said something unless supported by memory.
+- Use saved memories when relevant.
+- Never claim the user said something unless supported by memory.
 
 Saved memories:
 ${memoryText}`
@@ -189,12 +252,13 @@ ${memoryText}`
 
       res.end(JSON.stringify({ reply }));
 
+      // Update memory after sending the chat reply.
       updateMemory(message.trim()).catch(error => {
-        console.log("Memory update failed:", error.message);
+        console.error("Memory update failed:", error.message);
       });
 
     } catch (error) {
-      console.log("GENI AI error:", error.message);
+      console.error("GENI AI error:", error.message);
 
       if (!res.headersSent) {
         res.writeHead(500, {
@@ -210,5 +274,5 @@ ${memoryText}`
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`GENI AI backend running on port ${PORT}`);
+  console.log(`GENI AI Gemini backend running on port ${PORT}`);
 });
