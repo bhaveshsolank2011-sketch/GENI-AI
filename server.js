@@ -4,6 +4,7 @@ const path = require("path");
 
 const PORT = process.env.PORT || 3000;
 const MEMORY_FILE = path.join(__dirname, "memory.json");
+const MAX_BODY_SIZE = 1024 * 1024;
 
 const PROVIDERS = [
   {
@@ -11,6 +12,13 @@ const PROVIDERS = [
     key: process.env.OPENAI_API_KEY,
     url: "https://api.openai.com/v1/chat/completions",
     model: process.env.OPENAI_MODEL || "gpt-4.1-mini"
+  },
+  {
+    name: "Gemini",
+    key: process.env.GEMINI_API_KEY,
+    url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+    gemini: true
   },
   {
     name: "Groq",
@@ -32,18 +40,38 @@ const PROVIDERS = [
   }
 ];
 
+const SYSTEM_PROMPT = `
+You are GENI AI, an AI assistant project created by its developer.
+
+IDENTITY:
+- Your name is GENI AI.
+- You are not ChatGPT.
+- Do not claim OpenAI created GENI AI.
+- GENI AI may use language models from external AI providers through APIs.
+- If asked who created GENI AI, explain that GENI AI is a separate project developed by its developer.
+- Do not invent personal details about your developer.
+
+BEHAVIOUR:
+- Be friendly, helpful, honest, and clear.
+- Match the user's language. If the user writes in Hindi or Hinglish, reply naturally in Hindi or Hinglish.
+- Follow the user's request and answer the actual question.
+- Never claim a tool, feature, or action succeeded unless it actually did.
+- If you do not know something, say so honestly.
+`;
+
 function readMemory() {
   try {
     if (!fs.existsSync(MEMORY_FILE)) {
       fs.writeFileSync(MEMORY_FILE, "[]", "utf8");
     }
 
-    const data = JSON.parse(
+    const parsed = JSON.parse(
       fs.readFileSync(MEMORY_FILE, "utf8")
     );
 
-    return Array.isArray(data) ? data : [];
-  } catch {
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (error) {
+    console.error("Memory read error:", error.message);
     return [];
   }
 }
@@ -79,20 +107,20 @@ function readBody(req) {
     req.on("data", chunk => {
       size += chunk.length;
 
-      if (size > 1024 * 1024) {
-        reject(new Error("Request too large"));
+      if (size > MAX_BODY_SIZE) {
+        reject(new Error("Request body too large"));
         req.destroy();
         return;
       }
 
-      body += chunk;
+      body += chunk.toString("utf8");
     });
 
     req.on("end", () => {
       try {
         resolve(JSON.parse(body || "{}"));
       } catch {
-        reject(new Error("Invalid JSON"));
+        reject(new Error("Invalid JSON request"));
       }
     });
 
@@ -100,18 +128,29 @@ function readBody(req) {
   });
 }
 
-async function callOpenAICompatible(provider, messages) {
+async function callProvider(provider, messages) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 20000);
+
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, 20000);
 
   try {
+    const headers = {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${provider.key}`
+    };
+
+    if (provider.name === "OpenRouter") {
+      headers["HTTP-Referer"] =
+        "https://geni-ai-2.onrender.com";
+      headers["X-Title"] = "GENI AI";
+    }
+
     const response = await fetch(provider.url, {
       method: "POST",
+      headers,
       signal: controller.signal,
-      headers: {
-        "Authorization": `Bearer ${provider.key}`,
-        "Content-Type": "application/json"
-      },
       body: JSON.stringify({
         model: provider.model,
         messages,
@@ -120,115 +159,49 @@ async function callOpenAICompatible(provider, messages) {
       })
     });
 
-    const result = await response.json();
+    const data = await response.json();
 
     if (!response.ok) {
       throw new Error(
-        result.error?.message || `HTTP ${response.status}`
+        data.error?.message ||
+        `Provider returned HTTP ${response.status}`
       );
     }
 
-    const answer = result.choices?.[0]?.message?.content;
+    const answer = data.choices?.[0]?.message?.content;
 
     if (typeof answer !== "string" || !answer.trim()) {
-      throw new Error("Empty AI response");
+      throw new Error("Provider returned an empty answer");
     }
 
     return answer.trim();
   } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function callGemini(messages) {
-  const key = process.env.GEMINI_API_KEY;
-
-  if (!key) {
-    throw new Error("Gemini API key not configured");
-  }
-
-  const model =
-    process.env.GEMINI_MODEL || "gemini-2.5-flash";
-
-  const contents = messages
-    .filter(m => ["user", "assistant"].includes(m.role))
-    .map(m => ({
-      role: m.role === "assistant" ? "model" : "user",
-      parts: [{ text: String(m.content) }]
-    }));
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 20000);
-
-  try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-      {
-        method: "POST",
-        signal: controller.signal,
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": key
-        },
-        body: JSON.stringify({
-          systemInstruction: {
-            parts: [{
-              text: "You are GENI AI, a helpful, friendly assistant. Reply clearly in the user's language."
-            }]
-          },
-          contents,
-          generationConfig: {
-            temperature: 0.7,
-            maxOutputTokens: 2048
-          }
-        })
-      }
-    );
-
-    const result = await response.json();
-
-    if (!response.ok) {
-      throw new Error(
-        result.error?.message || `HTTP ${response.status}`
-      );
-    }
-
-    const answer = result.candidates?.[0]
-      ?.content?.parts
-      ?.map(part => part.text || "")
-      .join("");
-
-    if (!answer || !answer.trim()) {
-      throw new Error("Empty Gemini response");
-    }
-
-    return answer.trim();
-  } finally {
-    clearTimeout(timer);
+    clearTimeout(timeout);
   }
 }
 
 async function generateAnswer(messages) {
+  const configured = PROVIDERS.filter(
+    provider => provider.key
+  );
+
+  if (configured.length === 0) {
+    throw new Error(
+      "No AI API key configured. Add a provider key in Render Environment."
+    );
+  }
+
   const errors = [];
 
-  // Gemini is included in the automatic fallback chain.
-  const providers = [
-    ...PROVIDERS.filter(p => p.key),
-    ...(process.env.GEMINI_API_KEY ? [{
-      name: "Gemini",
-      run: () => callGemini(messages)
-    }] : [])
-  ];
-
-  for (const provider of providers) {
+  for (const provider of configured) {
     try {
-      console.log("Trying provider:", provider.name);
+      console.log(
+        `Trying ${provider.name} with model ${provider.model}`
+      );
 
-      const answer = provider.run
-        ? await provider.run()
-        : await callOpenAICompatible(provider, messages);
+      const answer = await callProvider(provider, messages);
 
-      console.log("Successful provider:", provider.name);
+      console.log(`${provider.name} responded successfully`);
 
       return {
         answer,
@@ -236,19 +209,18 @@ async function generateAnswer(messages) {
       };
     } catch (error) {
       console.error(
-        provider.name,
-        "failed:",
+        `${provider.name} failed:`,
         error.message
       );
 
-      errors.push(`${provider.name}: ${error.message}`);
+      errors.push(
+        `${provider.name}: ${error.message}`
+      );
     }
   }
 
   throw new Error(
-    errors.length
-      ? "All configured AI providers failed. Check API keys, model names, quota and provider status."
-      : "No AI provider is configured. Add at least one API key in Render Environment."
+    "All configured providers failed. Check API keys, model names, quota and provider status."
   );
 }
 
@@ -263,120 +235,142 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
 
-  const url = new URL(
-    req.url,
-    `http://${req.headers.host || "localhost"}`
-  );
+  let url;
+
+  try {
+    url = new URL(
+      req.url,
+      `http://${req.headers.host || "localhost"}`
+    );
+  } catch {
+    return sendJSON(res, 400, {
+      error: "Invalid URL"
+    });
+  }
 
   if (req.method === "GET" && url.pathname === "/") {
     return sendJSON(res, 200, {
       status: "ok",
       service: "GENI AI",
-      configuredProviders: [
-        ...PROVIDERS.filter(p => p.key).map(p => p.name),
-        ...(process.env.GEMINI_API_KEY ? ["Gemini"] : [])
-      ]
+      version: "2.0",
+      configuredProviders: PROVIDERS
+        .filter(provider => provider.key)
+        .map(provider => provider.name)
     });
   }
 
-  if (req.method === "POST" && url.pathname === "/chat") {
-    try {
-      const body = await readBody(req);
-
-      const memory = readMemory();
-
-      let messages = [];
-
-      if (Array.isArray(body.messages)) {
-        messages = body.messages
-          .filter(m =>
-            m &&
-            ["user", "assistant"].includes(m.role) &&
-            typeof m.content === "string"
-          )
-          .slice(-30);
-      } else if (typeof body.message === "string") {
-        messages = [{
-          role: "user",
-          content: body.message
-        }];
-      } else if (typeof body.prompt === "string") {
-        messages = [{
-          role: "user",
-          content: body.prompt
-        }];
-      } else {
-        return sendJSON(res, 400, {
-          error: "Send a message or messages array."
-        });
-      }
-
-      if (!messages.length) {
-        return sendJSON(res, 400, {
-          error: "No valid messages provided."
-        });
-      }
-
-      const recentMemory = memory
-        .slice(-15)
-        .map(item =>
-          `User: ${item.user}\nGENI: ${item.assistant}`
-        )
-        .join("\n\n");
-
-      const systemPrompt = {
-        role: "system",
-        content:
-          "You are GENI AI, a friendly and helpful AI assistant. " +
-          "Answer clearly and accurately. Match the user's language. " +
-          "Never claim you remember something unless it appears in the supplied context." +
-          (recentMemory
-            ? "\n\nRecent conversation context:\n" + recentMemory
-            : "")
-      };
-
-      // Avoid sending duplicate system prompts from the client.
-      const finalMessages = [
-        systemPrompt,
-        ...messages.filter(m => m.role !== "system")
-      ];
-
-      const result = await generateAnswer(finalMessages);
-
-      const lastUserMessage = [...messages]
-        .reverse()
-        .find(m => m.role === "user")?.content || "";
-
-      memory.push({
-        user: lastUserMessage.slice(0, 4000),
-        assistant: result.answer.slice(0, 6000),
-        timestamp: new Date().toISOString()
-      });
-
-      saveMemory(memory);
-
-      return sendJSON(res, 200, {
-        success: true,
-        reply: result.answer,
-        answer: result.answer,
-        response: result.answer,
-        provider: result.provider
-      });
-    } catch (error) {
-      console.error("Chat error:", error.message);
-
-      return sendJSON(res, 500, {
-        success: false,
-        error: error.message || "Something went wrong."
-      });
-    }
+  if (req.method !== "POST" || url.pathname !== "/chat") {
+    return sendJSON(res, 404, {
+      error: "Route not found"
+    });
   }
 
-  return sendJSON(res, 404, {
-    error: "Route not found"
-  });
+  try {
+    const body = await readBody(req);
+
+    let messages = [];
+
+    if (Array.isArray(body.messages)) {
+      messages = body.messages
+        .filter(message =>
+          message &&
+          ["user", "assistant"].includes(message.role) &&
+          typeof message.content === "string"
+        )
+        .slice(-30);
+    } else {
+      const message =
+        typeof body.message === "string"
+          ? body.message
+          : typeof body.prompt === "string"
+            ? body.prompt
+            : typeof body.text === "string"
+              ? body.text
+              : null;
+
+      if (message !== null) {
+        messages = [{
+          role: "user",
+          content: message
+        }];
+      }
+    }
+
+    if (messages.length === 0) {
+      return sendJSON(res, 400, {
+        success: false,
+        error: "Send a message, prompt, text, or messages array."
+      });
+    }
+
+    const lastUserMessage = [...messages]
+      .reverse()
+      .find(message => message.role === "user")?.content;
+
+    if (!lastUserMessage || !lastUserMessage.trim()) {
+      return sendJSON(res, 400, {
+        success: false,
+        error: "Your message is empty."
+      });
+    }
+
+    const memory = readMemory();
+
+    const recentContext = memory
+      .slice(-10)
+      .map(item =>
+        `User: ${item.user}\nGENI AI: ${item.assistant}`
+      )
+      .join("\n\n");
+
+    const systemMessage = {
+      role: "system",
+      content: SYSTEM_PROMPT +
+        (recentContext
+          ? "\n\nRecent conversation context:\n" +
+            recentContext
+          : "")
+    };
+
+    const finalMessages = [
+      systemMessage,
+      ...messages.filter(
+        message => message.role !== "system"
+      )
+    ];
+
+    const result = await generateAnswer(finalMessages);
+
+    memory.push({
+      user: lastUserMessage.slice(0, 3000),
+      assistant: result.answer.slice(0, 5000),
+      timestamp: new Date().toISOString()
+    });
+
+    saveMemory(memory);
+
+    return sendJSON(res, 200, {
+      success: true,
+      reply: result.answer,
+      answer: result.answer,
+      response: result.answer,
+      provider: result.provider
+    });
+
+  } catch (error) {
+    console.error("GENI AI request error:", error.message);
+
+    const status = error.message === "Invalid JSON request"
+      ? 400
+      : 500;
+
+    return sendJSON(res, status, {
+      success: false,
+      error: error.message || "GENI AI encountered an error."
+    });
+  }
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`GENI AI server running on port ${PORT}`);
+  console.log(`GENI AI listening on port ${PORT}`);
 });
