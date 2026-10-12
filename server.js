@@ -6,6 +6,28 @@ const PORT = process.env.PORT || 3000;
 const MEMORY_FILE = path.join(__dirname, "memory.json");
 const MAX_BODY_SIZE = 1024 * 1024;
 
+const SYSTEM_PROMPT = `
+You are GENI AI, an AI assistant developed by Bhavesh.
+
+IDENTITY RULES:
+- Your name is GENI AI.
+- Your developer is Bhavesh.
+- If asked your name, say: "Mera naam GENI AI hai!"
+- If asked who created you, say: "Mujhe Bhavesh ne banaya hai!"
+- If asked both, say: "Mera naam GENI AI hai aur mujhe Bhavesh ne banaya hai!"
+- Do not unnecessarily compare yourself with other AI assistants.
+- Never claim that OpenAI created GENI AI.
+- GENI AI is a separate project that can use external AI models through APIs.
+- Do not claim to have a different underlying model if you do not know which model is running.
+
+PERSONALITY:
+- Be friendly, helpful, honest, and clear.
+- Reply in the language the user uses.
+- Use natural Hindi and Hinglish when appropriate.
+- Answer the user's actual question directly.
+- Never invent facts or claim an action succeeded if it did not.
+`;
+
 const PROVIDERS = [
   {
     name: "OpenAI",
@@ -17,8 +39,7 @@ const PROVIDERS = [
     name: "Gemini",
     key: process.env.GEMINI_API_KEY,
     url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-    model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
-    gemini: true
+    model: process.env.GEMINI_MODEL || "gemini-2.5-flash"
   },
   {
     name: "Groq",
@@ -40,36 +61,17 @@ const PROVIDERS = [
   }
 ];
 
-const SYSTEM_PROMPT = `
-You are GENI AI, an AI assistant project created by its developer.
-
-IDENTITY:
-- Your name is GENI AI.
-- You are not ChatGPT.
-- Do not claim OpenAI created GENI AI.
-- GENI AI may use language models from external AI providers through APIs.
-- If asked who created GENI AI, explain that GENI AI is a separate project developed by its developer.
-- Do not invent personal details about your developer.
-
-BEHAVIOUR:
-- Be friendly, helpful, honest, and clear.
-- Match the user's language. If the user writes in Hindi or Hinglish, reply naturally in Hindi or Hinglish.
-- Follow the user's request and answer the actual question.
-- Never claim a tool, feature, or action succeeded unless it actually did.
-- If you do not know something, say so honestly.
-`;
-
 function readMemory() {
   try {
     if (!fs.existsSync(MEMORY_FILE)) {
       fs.writeFileSync(MEMORY_FILE, "[]", "utf8");
     }
 
-    const parsed = JSON.parse(
+    const data = JSON.parse(
       fs.readFileSync(MEMORY_FILE, "utf8")
     );
 
-    return Array.isArray(parsed) ? parsed : [];
+    return Array.isArray(data) ? data : [];
   } catch (error) {
     console.error("Memory read error:", error.message);
     return [];
@@ -130,10 +132,10 @@ function readBody(req) {
 
 async function callProvider(provider, messages) {
   const controller = new AbortController();
-
-  const timeout = setTimeout(() => {
-    controller.abort();
-  }, 20000);
+  const timeout = setTimeout(
+    () => controller.abort(),
+    20000
+  );
 
   try {
     const headers = {
@@ -164,14 +166,15 @@ async function callProvider(provider, messages) {
     if (!response.ok) {
       throw new Error(
         data.error?.message ||
-        `Provider returned HTTP ${response.status}`
+        `HTTP ${response.status}`
       );
     }
 
-    const answer = data.choices?.[0]?.message?.content;
+    const answer =
+      data.choices?.[0]?.message?.content;
 
     if (typeof answer !== "string" || !answer.trim()) {
-      throw new Error("Provider returned an empty answer");
+      throw new Error("Empty AI response");
     }
 
     return answer.trim();
@@ -187,7 +190,7 @@ async function generateAnswer(messages) {
 
   if (configured.length === 0) {
     throw new Error(
-      "No AI API key configured. Add a provider key in Render Environment."
+      "No AI provider configured. Add an API key in Render Environment."
     );
   }
 
@@ -196,12 +199,17 @@ async function generateAnswer(messages) {
   for (const provider of configured) {
     try {
       console.log(
-        `Trying ${provider.name} with model ${provider.model}`
+        `Trying ${provider.name}: ${provider.model}`
       );
 
-      const answer = await callProvider(provider, messages);
+      const answer = await callProvider(
+        provider,
+        messages
+      );
 
-      console.log(`${provider.name} responded successfully`);
+      console.log(
+        `${provider.name} responded successfully`
+      );
 
       return {
         answer,
@@ -220,7 +228,7 @@ async function generateAnswer(messages) {
   }
 
   throw new Error(
-    "All configured providers failed. Check API keys, model names, quota and provider status."
+    "All configured AI providers failed. Check API keys, model names, quotas and provider status."
   );
 }
 
@@ -244,6 +252,7 @@ const server = http.createServer(async (req, res) => {
     );
   } catch {
     return sendJSON(res, 400, {
+      success: false,
       error: "Invalid URL"
     });
   }
@@ -252,7 +261,8 @@ const server = http.createServer(async (req, res) => {
     return sendJSON(res, 200, {
       status: "ok",
       service: "GENI AI",
-      version: "2.0",
+      version: "2.1",
+      developer: "Bhavesh",
       configuredProviders: PROVIDERS
         .filter(provider => provider.key)
         .map(provider => provider.name)
@@ -261,12 +271,14 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method !== "POST" || url.pathname !== "/chat") {
     return sendJSON(res, 404, {
+      success: false,
       error: "Route not found"
     });
   }
 
   try {
     const body = await readBody(req);
+    const memory = readMemory();
 
     let messages = [];
 
@@ -299,22 +311,20 @@ const server = http.createServer(async (req, res) => {
     if (messages.length === 0) {
       return sendJSON(res, 400, {
         success: false,
-        error: "Send a message, prompt, text, or messages array."
+        error: "Send a message or messages array."
       });
     }
 
     const lastUserMessage = [...messages]
       .reverse()
-      .find(message => message.role === "user")?.content;
+      .find(message => message.role === "user");
 
-    if (!lastUserMessage || !lastUserMessage.trim()) {
+    if (!lastUserMessage || !lastUserMessage.content.trim()) {
       return sendJSON(res, 400, {
         success: false,
         error: "Your message is empty."
       });
     }
-
-    const memory = readMemory();
 
     const recentContext = memory
       .slice(-10)
@@ -342,7 +352,7 @@ const server = http.createServer(async (req, res) => {
     const result = await generateAnswer(finalMessages);
 
     memory.push({
-      user: lastUserMessage.slice(0, 3000),
+      user: lastUserMessage.content.slice(0, 3000),
       assistant: result.answer.slice(0, 5000),
       timestamp: new Date().toISOString()
     });
@@ -358,19 +368,21 @@ const server = http.createServer(async (req, res) => {
     });
 
   } catch (error) {
-    console.error("GENI AI request error:", error.message);
+    console.error(
+      "GENI AI request error:",
+      error.message
+    );
 
-    const status = error.message === "Invalid JSON request"
-      ? 400
-      : 500;
-
-    return sendJSON(res, status, {
+    return sendJSON(res, 500, {
       success: false,
-      error: error.message || "GENI AI encountered an error."
+      error: error.message ||
+        "GENI AI encountered an error."
     });
   }
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`GENI AI listening on port ${PORT}`);
+  console.log(
+    `GENI AI server running on port ${PORT}`
+  );
 });
